@@ -174,5 +174,109 @@ PHP_ROUTER
 php -l /usr/local/bin/getcontact-router.php
 ROUTER
 
+# Add Russian number input support. Getcontact/VerifyKit API support is NOT guaranteed.
+RUN <<'RUSSIAN_PHONE_PATCH' bash
+set -euo pipefail
+cat >/tmp/patch-phone.php <<'PATCH_PHP'
+<?php
+function patch_exact(string $path, string $old, string $new): void {
+  $body = file_get_contents($path);
+  if ($body === false || !str_contains($body, $old)) {
+    fwrite(STDERR, "Missing expected input in $path\n");
+    exit(1);
+  }
+  file_put_contents($path, str_replace($old, $new, $body));
+}
+
+$serverOld = <<<'OLD'
+      if (strpos($phone_number, "0") === 0) {
+        $phone_number = "+62" . substr($phone_number, 1);
+      } else if (
+        strpos($phone_number, "62") === 0
+      ) {
+        $phone_number = "+" . $phone_number;
+      } else if (strpos($phone_number, "-") !== false || strpos($phone_number, " ") !== false) {
+        $phone_number = str_replace(["-", " "], "", $phone_number);
+      } else {
+OLD;
+$serverNew = <<<'NEW'
+      $digits = preg_replace('/\D/', '', $phone_number);
+      if (preg_match('/^7\d{10}$/', $digits)) {
+        $phone_number = "+" . $digits;
+      } else if (preg_match('/^8\d{10}$/', $digits)) {
+        $phone_number = "+7" . substr($digits, 1);
+      } else {
+NEW;
+patch_exact('src/apis/generate_credentials.php', $serverOld, $serverNew);
+patch_exact('src/apis/generate_credentials.php',
+  "if (strpos(\$phone_number, '+62') === 0) {\n        \$outside_phone_number = substr(\$phone_number, 3); // cut first 3 char (+62)\n      }",
+  "if (strpos(\$phone_number, '+7') === 0) {\n        \$outside_phone_number = substr(\$phone_number, 2); // strip +7 for RU VerifyKit\n      }");
+
+$searchOld = <<<'OLD'
+      if (strpos($phone_number, "0") === 0) {
+        $phone_number = "+62" . substr($phone_number, 1);
+      } else if (strpos($phone_number, "62") === 0) {
+        $phone_number = "+" . $phone_number;
+      } else if (strpos($phone_number, "-") !== false || strpos($phone_number, " ") !== false) {
+        $phone_number = str_replace(["-", " "], "", $phone_number);
+      } else {
+OLD;
+$searchNew = <<<'NEW'
+      $digits = preg_replace('/\D/', '', $phone_number);
+      if (preg_match('/^7\d{10}$/', $digits)) {
+        $phone_number = "+" . $digits;
+      } else if (preg_match('/^8\d{10}$/', $digits)) {
+        $phone_number = "+7" . substr($digits, 1);
+      } else {
+NEW;
+patch_exact('src/pages/index.php', $searchOld, $searchNew);
+
+$genUiOld = <<<'OLD'
+        } else if (!(phoneNumber.startsWith("0") || phoneNumber.startsWith("62"))) {
+          $phoneInput.addClass("is-invalid");
+          $phoneFeedback.text("Phone number prefix is invalid");
+          isPhoneNumberValid = false;
+OLD;
+$genUiNew = <<<'NEW'
+        } else if (!/^[78]\d{10}$/.test(phoneNumber)) {
+          $phoneInput.addClass("is-invalid");
+          $phoneFeedback.text("Enter a Russian number: 7XXXXXXXXXX or 8XXXXXXXXXX");
+          isPhoneNumberValid = false;
+NEW;
+patch_exact('src/pages/dashboard/generate_credentials.php', $genUiOld, $genUiNew);
+
+$searchUiOld = <<<'OLD'
+      if (!(phoneNumber.startsWith("0") || phoneNumber.startsWith("62")))
+        return setValidationState($phoneInput, false, "Phone number prefix is invalid"), false;
+OLD;
+$searchUiNew = <<<'NEW'
+      if (!/^[78]\d{10}$/.test(phoneNumber))
+        return setValidationState($phoneInput, false, "Enter Russian number: 7XXXXXXXXXX or 8XXXXXXXXXX"), false;
+NEW;
+patch_exact('src/pages/index.php', $searchUiOld, $searchUiNew);
+
+foreach (['src/pages/index.php', 'src/pages/dashboard/generate_credentials.php'] as $path) {
+  patch_exact($path, 'Phone Number &#127470;&#127465;', 'Phone Number &#127479;&#127482;');
+  patch_exact($path, 'placeholder="62xxx / 0xxx"', 'placeholder="7XXXXXXXXXX / 8XXXXXXXXXX"');
+}
+
+$configPath = 'src/configurations/getcontact.php';
+foreach ([
+  'define("GTC_COUNTRY_CODE", "id");' => 'define("GTC_COUNTRY_CODE", "ru");',
+  'define("GTC_CARRIER_COUNTRY_CODE", "510");' => 'define("GTC_CARRIER_COUNTRY_CODE", "250");',
+  'define("GTC_CARRIER_NAME", "Indosat Ooredoo");' => 'define("GTC_CARRIER_NAME", "MTS");',
+  'define("GTC_TIME_ZONE", "Asia/Bangkok");' => 'define("GTC_TIME_ZONE", "Europe/Moscow");',
+  'define("GTC_OUTSIDE_COUNTRY_CODE", "ID");' => 'define("GTC_OUTSIDE_COUNTRY_CODE", "RU");',
+  'define("VFK_LANG", "in_ID");' => 'define("VFK_LANG", "ru_RU");',
+] as $before => $after) patch_exact($configPath, $before, $after);
+
+PATCH_PHP
+php /tmp/patch-phone.php
+php -l src/apis/generate_credentials.php
+php -l src/pages/index.php
+php -l src/pages/dashboard/generate_credentials.php
+php -l src/configurations/getcontact.php
+RUSSIAN_PHONE_PATCH
+
 EXPOSE 80
 CMD ["php", "-S", "0.0.0.0:80", "-t", "/var/www/html", "/usr/local/bin/getcontact-router.php"]
