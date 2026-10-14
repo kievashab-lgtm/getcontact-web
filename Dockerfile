@@ -278,5 +278,61 @@ php -l src/pages/dashboard/generate_credentials.php
 php -l src/configurations/getcontact.php
 RUSSIAN_PHONE_PATCH
 
+# Use the real, provider-returned WhatsApp verification link. Never reconstruct
+# its recipient from a hard-coded phone number in the original sample code.
+RUN <<'VERIFYKIT_LINK_PATCH' bash
+set -euo pipefail
+cat >/tmp/patch-verifykit.php <<'PATCH_PHP'
+<?php
+function replace_exact(string $path, string $old, string $new): void {
+  $source = file_get_contents($path);
+  if ($source === false || !str_contains($source, $old)) {
+    fwrite(STDERR, "Expected verification link code not found in $path\n");
+    exit(1);
+  }
+  file_put_contents($path, str_replace($old, $new, $source));
+}
+$backend = 'src/apis/generate_credentials.php';
+$checkOld = <<<'OLD'
+      #endregion
+
+      #region Parse and validate verification code from deeplink url
+OLD;
+$checkNew = <<<'NEW'
+      // Only accept a WhatsApp deep link returned directly by VerifyKit.
+      $linkParts = parse_url($deeplink);
+      if (!is_array($linkParts)
+          || strtolower($linkParts['scheme'] ?? '') !== 'https'
+          || !in_array(strtolower($linkParts['host'] ?? ''),
+              ['wa.me', 'api.whatsapp.com', 'web.whatsapp.com'], true)) {
+        http_response_code(502);
+        echo json_encode(['message' => 'VerifyKit returned an unexpected verification link']);
+        exit();
+      }
+
+      #endregion
+
+      #region Parse and validate verification code from deeplink url
+NEW;
+replace_exact($backend, $checkOld, $checkNew);
+replace_exact($backend,
+  '"verificationCode" => $verification_code, // for public view',
+  '"verificationCode" => $verification_code, // for public view' . "\n        \"verifyLink\" => \$deeplink,");
+
+$frontend = 'src/pages/dashboard/generate_credentials.php';
+replace_exact($frontend,
+  'const deeplinkWhatsappDesktopMobile = `https://api.whatsapp.com/send/?phone=905397766590&type=phone_number&app_absent=0&text=${response.verificationCode}`;',
+  "const deeplinkWhatsappDesktopMobile = response.verifyLink;\n        if (!deeplinkWhatsappDesktopMobile || !/^https:\\/\\/(?:wa\\.me|api\\.whatsapp\\.com|web\\.whatsapp\\.com)\\//i.test(deeplinkWhatsappDesktopMobile)) {\n          throw new Error('VerifyKit returned an invalid WhatsApp verification link');\n        }");
+replace_exact($frontend,
+  'const deeplinkWhatsappWeb = `https://web.whatsapp.com/send?phone=905397766590&text=${response.verificationCode}`;',
+  'const deeplinkWhatsappWeb = response.verifyLink;');
+replace_exact($frontend, '>WhatsApp Web</div>', '>VerifyKit WhatsApp link</div>');
+PATCH_PHP
+php -l /tmp/patch-verifykit.php
+php /tmp/patch-verifykit.php
+php -l src/apis/generate_credentials.php
+php -l src/pages/dashboard/generate_credentials.php
+VERIFYKIT_LINK_PATCH
+
 EXPOSE 80
 CMD ["php", "-S", "0.0.0.0:80", "-t", "/var/www/html", "/usr/local/bin/getcontact-router.php"]
