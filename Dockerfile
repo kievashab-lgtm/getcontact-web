@@ -118,11 +118,61 @@ START
 chmod +x /usr/local/bin/start-getcontact
 chown -R www-data:www-data /var/www/html
 SETUP
+
+# Debian dependency installation can enable mpm_event alongside PHP's
+# mpm_prefork. Apache refuses to start if both are loaded.
 RUN rm -f /etc/apache2/mods-enabled/mpm_event.load \
-  /etc/apache2/mods-enabled/mpm_event.conf \
-  /etc/apache2/mods-enabled/mpm_worker.load \
-  /etc/apache2/mods-enabled/mpm_worker.conf \
+           /etc/apache2/mods-enabled/mpm_event.conf \
+           /etc/apache2/mods-enabled/mpm_worker.load \
+           /etc/apache2/mods-enabled/mpm_worker.conf \
  && a2enmod mpm_prefork \
  && apache2ctl -t
+
+# Use a private PHP router instead of Apache to avoid platform-specific MPM conflicts.
+RUN <<'ROUTER' bash
+set -e
+cat > /usr/local/bin/getcontact-router.php <<'PHP_ROUTER'
+<?php
+// Private, single-user PHP router for Railway. No Apache MPM is needed.
+$expectedPassword = getenv('ADMIN_PASSWORD') ?: '';
+$providedUser = $_SERVER['PHP_AUTH_USER'] ?? '';
+$providedPassword = $_SERVER['PHP_AUTH_PW'] ?? '';
+if ($expectedPassword === '' || !hash_equals('admin', $providedUser) || !hash_equals($expectedPassword, $providedPassword)) {
+    header('WWW-Authenticate: Basic realm="Private Getcontact Web"');
+    http_response_code(401);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "Authorization required.\n";
+    return true;
+}
+if (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https') {
+    $_SERVER['HTTPS'] = 'on';
+}
+$path = rawurldecode(parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/');
+// Only assets inside /public/ are served as files. Never expose PHP, SQL, source or configs.
+if (preg_match('~^/public/(?:css|js|images)/[a-zA-Z0-9._/-]+$~', $path)
+    && !str_contains($path, '..')
+    && preg_match('~\.(?:css|js|webp|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf)$~i', $path)) {
+    $file = '/var/www/html' . $path;
+    if (is_file($file)) {
+        $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+        $mime = [
+            'css' => 'text/css', 'js' => 'text/javascript', 'webp' => 'image/webp',
+            'png' => 'image/png', 'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg',
+            'gif' => 'image/gif', 'svg' => 'image/svg+xml', 'ico' => 'image/x-icon',
+            'woff' => 'font/woff', 'woff2' => 'font/woff2', 'ttf' => 'font/ttf',
+        ];
+        header('Content-Type: ' . ($mime[$ext] ?? 'application/octet-stream'));
+        readfile($file);
+        return true;
+    }
+}
+$_SERVER['SCRIPT_NAME'] = '/index.php';
+$_SERVER['PHP_SELF'] = '/index.php';
+require '/var/www/html/index.php';
+return true;
+PHP_ROUTER
+php -l /usr/local/bin/getcontact-router.php
+ROUTER
+
 EXPOSE 80
-CMD ["/usr/local/bin/start-getcontact"]
+CMD ["php", "-S", "0.0.0.0:80", "-t", "/var/www/html", "/usr/local/bin/getcontact-router.php"]
