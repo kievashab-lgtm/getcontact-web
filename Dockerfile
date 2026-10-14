@@ -334,5 +334,62 @@ php -l src/apis/generate_credentials.php
 php -l src/pages/dashboard/generate_credentials.php
 VERIFYKIT_LINK_PATCH
 
+
+# Correct hard-coded Indonesian country headers in Getcontact requests.
+# Keep authentication secrets and API payloads out of Railway logs.
+RUN <<'PATCH_RU_HEADERS' bash
+set -euo pipefail
+cat > /tmp/patch-ru-headers.php <<'PHP_PATCH'
+<?php
+$path='src/libraries/getcontact.php';
+$source=file_get_contents($path);
+$old='"x-country-code: id"';
+$count=substr_count($source,$old);
+if($count < 1){fwrite(STDERR,"Country header not found; inspect upstream code.\n");exit(1);}
+$source=str_replace($old,'"x-country-code: " . GTC_COUNTRY_CODE',$source);
+file_put_contents($path,$source);
+echo "Updated $count hard-coded country headers.\n";
+
+$path='src/libraries/helper.php';
+$source=file_get_contents($path);
+$pattern='/  function log_api_transaction\(\$request, \$response, \$label = "API"\)\s*\{.*?\n  \}/s';
+$replacement=<<<'SAFE'
+  function log_api_transaction($request, $response, $label = "API")
+  {
+    $code = isset($response->httpCode) ? (int)$response->httpCode : 0;
+    error_log("GetContact [$label] HTTP $code (API bodies redacted)");
+  }
+SAFE;
+$source=preg_replace($pattern,$replacement,$source,1,$count);
+if($count!==1){fwrite(STDERR,"Credential logging replacement failed.\n");exit(1);}
+$source=preg_replace('/^\s*error_log\("(?:Header|Body): " \. .*?\);\r?\n/m','',$source);
+file_put_contents($path,$source);
+
+foreach (['src/apis/generate_credentials.php','src/pages/index.php','src/apis/subscription.php'] as $path) {
+  $source=file_get_contents($path);
+  foreach (['$api_response->body','$decrypted_data_raw','$raw_json','$api_response_body->data'] as $variable) {
+    $source=str_replace('error_log('.$variable.');','/* API body logging disabled. */',$source);
+  }
+  if ($path==='src/apis/generate_credentials.php') {
+    $privateLog=<<<'PRIVATELOG'
+      error_log(json_encode([
+        "phoneNumber" => $phone_number,
+        "clientDeviceId" => $client_device_id,
+        "token" => $token,
+        "finalKey" => $final_key,
+        "validationDate" => $validation_date,
+      ], JSON_PRETTY_PRINT));
+PRIVATELOG;
+    if(!str_contains($source,$privateLog)){fwrite(STDERR,"Success credential log was not found.\n");exit(1);}
+    $source=str_replace($privateLog,'// Successful validation. Do not log credentials.',$source);
+  }
+  file_put_contents($path,$source);
+}
+PHP_PATCH
+php -l /tmp/patch-ru-headers.php
+php /tmp/patch-ru-headers.php
+for f in src/libraries/getcontact.php src/libraries/helper.php src/apis/generate_credentials.php src/pages/index.php src/apis/subscription.php; do php -l "$f"; done
+PATCH_RU_HEADERS
+
 EXPOSE 80
 CMD ["php", "-S", "0.0.0.0:80", "-t", "/var/www/html", "/usr/local/bin/getcontact-router.php"]
