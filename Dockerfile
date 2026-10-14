@@ -391,5 +391,81 @@ php /tmp/patch-ru-headers.php
 for f in src/libraries/getcontact.php src/libraries/helper.php src/apis/generate_credentials.php src/pages/index.php src/apis/subscription.php; do php -l "$f"; done
 PATCH_RU_HEADERS
 
+
+# Diagnose the returned HTTP status and content type without exposing API payloads,
+# phone numbers, session credentials, verification codes or response headers.
+RUN <<'PATCH_API_DIAGNOSTICS' bash
+set -euo pipefail
+cat >/tmp/patch-api-diagnostics.php <<'DIAG_PHP'
+<?php
+function replace_once(string $path, string $old, string $new): void {
+  $content = file_get_contents($path);
+  if ($content === false || substr_count($content, $old) !== 1) {
+    fwrite(STDERR, "Expected code block not found exactly once in $path.\n");
+    exit(1);
+  }
+  file_put_contents($path, str_replace($old, $new, $content));
+}
+$diag = <<<'PHP'
+  // Safe diagnostic: return only status and MIME type. Do not log raw responses.
+  $upstream_code = (int)($api_response->httpCode ?? 0);
+  $upstream_mime = 'unknown';
+  $header_block = (string)($api_response->header ?? '');
+  if (preg_match_all('/(?:^|\r?\n)Content-Type:\s*([a-zA-Z0-9.+\/-]+)/i', $header_block, $matches) && !empty($matches[1])) {
+    $upstream_mime = strtolower(end($matches[1]));
+  }
+  $upstream_diag = "HTTP $upstream_code; Content-Type $upstream_mime";
+PHP;
+$captcha = 'src/apis/refresh_captcha.php';
+replace_once($captcha,
+  '  $api_response = getcontact_call_api_refresh_code($api_request);',
+  '  $api_response = getcontact_call_api_refresh_code($api_request);' . "\n\n" . $diag . <<<'EXTRA'
+
+  if ($upstream_code !== 200) {
+    http_response_code(400);
+    echo json_encode(['message' => 'Getcontact CAPTCHA request denied (' . $upstream_diag . ')']);
+    exit();
+  }
+EXTRA
+);
+$captchaContent = file_get_contents($captcha);
+$oldMessage = '"message" => "Invalid JSON response. Please check error log."';
+if (substr_count($captchaContent, $oldMessage) < 1) {
+  fwrite(STDERR, "CAPTCHA JSON error handler not found.\n"); exit(1);
+}
+$captchaContent = preg_replace(
+  '/"message" => "Invalid JSON response\. Please check error log\."/',
+  '"message" => "Getcontact CAPTCHA response could not be decoded (" . $upstream_diag . ")"',
+  $captchaContent, 1, $changed
+);
+if ($changed !== 1) { fwrite(STDERR, "CAPTCHA diagnostic replacement failed.\n"); exit(1); }
+file_put_contents($captcha, $captchaContent);
+// Subscription: keep the normal behavior, but reveal upstream status and MIME type.
+$subscription = 'src/apis/subscription.php';
+replace_once($subscription,
+  '  $api_response = getcontact_call_api_subscription($api_request);',
+  '  $api_response = getcontact_call_api_subscription($api_request);' . "\n\n" . $diag
+);
+replace_once($subscription,
+  '"message" => "Invalid HTTP status code: " . $api_response->httpCode',
+  '"message" => "Getcontact subscription rejected (" . $upstream_diag . ")"'
+);
+// Do not leak raw bodies to logs on any error path.
+foreach (['src/apis/refresh_captcha.php', 'src/apis/verify_captcha.php',
+          'src/apis/subscription.php', 'src/pages/index.php'] as $path) {
+  $content = file_get_contents($path);
+  foreach (['$api_response->body', '$decrypted_data_raw', '$raw_json', '$api_response_body->data'] as $secret) {
+    $content = str_replace('error_log(' . $secret . ');', '/* sensitive payload not logged */', $content);
+  }
+  $content = str_replace('error_log(json_encode($decrypted_body, JSON_PRETTY_PRINT));',
+                         '/* decrypted response not logged */', $content);
+  file_put_contents($path, $content);
+}
+DIAG_PHP
+php -l /tmp/patch-api-diagnostics.php
+php /tmp/patch-api-diagnostics.php
+for f in src/apis/refresh_captcha.php src/apis/verify_captcha.php src/apis/subscription.php src/pages/index.php; do php -l "$f"; done
+PATCH_API_DIAGNOSTICS
+
 EXPOSE 80
 CMD ["php", "-S", "0.0.0.0:80", "-t", "/var/www/html", "/usr/local/bin/getcontact-router.php"]
